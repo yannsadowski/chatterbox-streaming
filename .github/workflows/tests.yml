@@ -1,0 +1,79 @@
+name: Tests
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install UV
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Verify UV installation
+      run: uv --version
+
+    - name: Install dependencies
+      run: |
+        uv pip install --system -e ".[dev]"
+
+    - name: Check code syntax
+      run: |
+        python -m py_compile src/chatterbox/*.py
+        python -m py_compile src/chatterbox/models/*.py
+
+    - name: Run basic import tests
+      run: |
+        python -c "from chatterbox import ChatterboxTTS, SUPPORTED_LANGUAGES"
+        python -c "from chatterbox import StreamingMetrics"
+        python -c "print('All imports successful!')"
+
+    - name: Verify supported languages
+      run: |
+        python -c "from chatterbox import SUPPORTED_LANGUAGES; assert len(SUPPORTED_LANGUAGES) == 23"
+
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install UV
+      run: |
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Install linting tools
+      run: |
+        uv pip install --system ruff black
+
+    - name: Check formatting with black
+      run: |
+        black --check src/
+
+    - name: Lint with ruff
+      run: |
+        ruff check src/
