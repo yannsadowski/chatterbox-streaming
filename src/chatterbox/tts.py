@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import time
 from typing import Generator, Tuple, Optional
 
@@ -8,18 +9,46 @@ import numpy as np
 import torch
 import perth
 import torch.nn.functional as F
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors.torch import load_file
 
 from .models.t3 import T3
+from .models.t3.modules.t3_config import T3Config
 from .models.s3tokenizer import S3_SR, drop_invalid_tokens
 from .models.s3gen import S3GEN_SR, S3Gen
-from .models.tokenizers import EnTokenizer
+from .models.tokenizers import EnTokenizer, MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
 
 
 REPO_ID = "ResembleAI/chatterbox"
+
+# Supported languages for the multilingual model
+SUPPORTED_LANGUAGES = {
+  "ar": "Arabic",
+  "da": "Danish",
+  "de": "German",
+  "el": "Greek",
+  "en": "English",
+  "es": "Spanish",
+  "fi": "Finnish",
+  "fr": "French",
+  "he": "Hebrew",
+  "hi": "Hindi",
+  "it": "Italian",
+  "ja": "Japanese",
+  "ko": "Korean",
+  "ms": "Malay",
+  "nl": "Dutch",
+  "no": "Norwegian",
+  "pl": "Polish",
+  "pt": "Portuguese",
+  "ru": "Russian",
+  "sv": "Swedish",
+  "sw": "Swahili",
+  "tr": "Turkish",
+  "zh": "Chinese",
+}
 
 
 def punc_norm(text: str) -> str:
@@ -57,7 +86,7 @@ def punc_norm(text: str) -> str:
 
     # Add full stop if no ending punc
     text = text.rstrip(" ")
-    sentence_enders = {".", "!", "?", "-", ","}
+    sentence_enders = {".", "!", "?", "-", ",", "、", "，", "。", "？", "！"}
     if not any(text.endswith(p) for p in sentence_enders):
         text += "."
 
@@ -125,9 +154,10 @@ class ChatterboxTTS:
         t3: T3,
         s3gen: S3Gen,
         ve: VoiceEncoder,
-        tokenizer: EnTokenizer,
+        tokenizer,  # Can be EnTokenizer or MTLTokenizer
         device: str,
         conds: Conditionals = None,
+        multilingual: bool = False,
     ):
         self.sr = S3GEN_SR  # sample rate of synthesized audio
         self.t3 = t3
@@ -137,9 +167,23 @@ class ChatterboxTTS:
         self.device = device
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
+        self.multilingual = multilingual
 
     @classmethod
-    def from_local(cls, ckpt_dir, device) -> 'ChatterboxTTS':
+    def get_supported_languages(cls):
+        """Return dictionary of supported language codes and names."""
+        return SUPPORTED_LANGUAGES.copy()
+
+    @classmethod
+    def from_local(cls, ckpt_dir, device, multilingual=False) -> 'ChatterboxTTS':
+        """
+        Load model from local checkpoint directory.
+
+        Args:
+            ckpt_dir: Path to checkpoint directory
+            device: Device to load model on ('cuda', 'cpu', 'mps')
+            multilingual: If True, load multilingual model; otherwise load English-only model
+        """
         ckpt_dir = Path(ckpt_dir)
 
         # Always load to CPU first for non-CUDA devices to handle CUDA-saved models
@@ -148,37 +192,69 @@ class ChatterboxTTS:
         else:
             map_location = None
 
+        # Voice Encoder (same for both models)
         ve = VoiceEncoder()
-        ve.load_state_dict(
-            load_file(ckpt_dir / "ve.safetensors")
-        )
+        if multilingual:
+            ve.load_state_dict(
+                torch.load(ckpt_dir / "ve.pt", weights_only=True, map_location=map_location)
+            )
+        else:
+            ve.load_state_dict(
+                load_file(ckpt_dir / "ve.safetensors")
+            )
         ve.to(device).eval()
 
-        t3 = T3()
-        t3_state = load_file(ckpt_dir / "t3_cfg.safetensors")
+        # T3 model
+        if multilingual:
+            t3 = T3(T3Config.multilingual())
+            t3_state = load_file(ckpt_dir / "t3_mtl23ls_v2.safetensors")
+        else:
+            t3 = T3()
+            t3_state = load_file(ckpt_dir / "t3_cfg.safetensors")
+
         if "model" in t3_state.keys():
             t3_state = t3_state["model"][0]
         t3.load_state_dict(t3_state)
         t3.to(device).eval()
 
+        # S3Gen (same for both models)
         s3gen = S3Gen()
-        s3gen.load_state_dict(
-            load_file(ckpt_dir / "s3gen.safetensors"), strict=False
-        )
+        if multilingual:
+            s3gen.load_state_dict(
+                torch.load(ckpt_dir / "s3gen.pt", weights_only=True, map_location=map_location), strict=False
+            )
+        else:
+            s3gen.load_state_dict(
+                load_file(ckpt_dir / "s3gen.safetensors"), strict=False
+            )
         s3gen.to(device).eval()
 
-        tokenizer = EnTokenizer(
-            str(ckpt_dir / "tokenizer.json")
-        )
+        # Tokenizer
+        if multilingual:
+            tokenizer = MTLTokenizer(
+                str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json")
+            )
+        else:
+            tokenizer = EnTokenizer(
+                str(ckpt_dir / "tokenizer.json")
+            )
 
+        # Load conditionals if available
         conds = None
         if (builtin_voice := ckpt_dir / "conds.pt").exists():
             conds = Conditionals.load(builtin_voice, map_location=map_location).to(device)
 
-        return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
+        return cls(t3, s3gen, ve, tokenizer, device, conds=conds, multilingual=multilingual)
 
     @classmethod
-    def from_pretrained(cls, device) -> 'ChatterboxTTS':
+    def from_pretrained(cls, device, multilingual=False) -> 'ChatterboxTTS':
+        """
+        Load model from Hugging Face Hub.
+
+        Args:
+            device: Device to load model on ('cuda', 'cpu', 'mps')
+            multilingual: If True, load multilingual model; otherwise load English-only model
+        """
         # Check if MPS is available on macOS
         if device == "mps" and not torch.backends.mps.is_available():
             if not torch.backends.mps.is_built():
@@ -187,10 +263,31 @@ class ChatterboxTTS:
                 print("MPS not available because the current MacOS version is not 12.3+ and/or you do not have an MPS-enabled device on this machine.")
             device = "cpu"
 
-        for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
-            local_path = hf_hub_download(repo_id=REPO_ID, filename=fpath)
+        if multilingual:
+            # Download multilingual model files
+            ckpt_dir = Path(
+                snapshot_download(
+                    repo_id=REPO_ID,
+                    repo_type="model",
+                    revision="main",
+                    allow_patterns=[
+                        "ve.pt",
+                        "t3_mtl23ls_v2.safetensors",
+                        "s3gen.pt",
+                        "grapheme_mtl_merged_expanded_v1.json",
+                        "conds.pt",
+                        "Cangjie5_TC.json"
+                    ],
+                    token=os.getenv("HF_TOKEN"),
+                )
+            )
+        else:
+            # Download English-only model files
+            for fpath in ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json", "conds.pt"]:
+                local_path = hf_hub_download(repo_id=REPO_ID, filename=fpath)
+            ckpt_dir = Path(local_path).parent
 
-        return cls.from_local(Path(local_path).parent, device)
+        return cls.from_local(ckpt_dir, device, multilingual=multilingual)
 
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav
@@ -221,6 +318,7 @@ class ChatterboxTTS:
     def generate(
         self,
         text,
+        language_id=None,
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
@@ -229,13 +327,43 @@ class ChatterboxTTS:
         cfg_weight=0.5,
         temperature=0.8,
     ):
+        """
+        Generate speech from text.
+
+        Args:
+            text: Input text to synthesize
+            language_id: Language code (only used with multilingual model).
+                         For English-only model, this is ignored.
+            repetition_penalty: Penalty for repeating tokens
+            min_p: Minimum probability threshold
+            top_p: Top-p sampling threshold
+            audio_prompt_path: Optional path to reference audio for voice cloning
+            exaggeration: Emotion exaggeration factor (0.0 to 1.0)
+            cfg_weight: Classifier-free guidance weight
+            temperature: Sampling temperature
+
+        Returns:
+            torch.Tensor: Generated audio waveform
+        """
+        # Validate language_id for multilingual model
+        if self.multilingual and language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. "
+                f"Supported languages: {supported_langs}"
+            )
+
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+        if self.conds and self.conds.t3.emotion_adv is not None:
+            current_exag = float(self.conds.t3.emotion_adv[0, 0, 0].item())
+        else:
+            current_exag = 0.0
+        if float(exaggeration) != current_exag:
             _cond: T3Cond = self.conds.t3
             self.conds.t3 = T3Cond(
                 speaker_emb=_cond.speaker_emb,
@@ -245,7 +373,12 @@ class ChatterboxTTS:
 
         # Norm and tokenize text
         text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        if self.multilingual:
+            text_tokens = self.tokenizer.text_to_tokens(
+                text, language_id=language_id.lower() if language_id else None
+            ).to(self.device)
+        else:
+            text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
 
         if cfg_weight > 0.0:
             text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
@@ -271,8 +404,10 @@ class ChatterboxTTS:
 
             # TODO: output becomes 1D
             speech_tokens = drop_invalid_tokens(speech_tokens)
-            
-            speech_tokens = speech_tokens[speech_tokens < 6561]
+
+            # Filter invalid tokens for English-only model
+            if not self.multilingual:
+                speech_tokens = speech_tokens[speech_tokens < 6561]
 
             speech_tokens = speech_tokens.to(self.device)
 
@@ -499,6 +634,7 @@ class ChatterboxTTS:
     def generate_stream(
         self,
         text: str,
+        language_id: Optional[str] = None,
         audio_prompt_path: Optional[str] = None,
         exaggeration: float = 0.5,
         cfg_weight: float = 0.5,
@@ -510,9 +646,11 @@ class ChatterboxTTS:
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming version of generate that yields audio chunks as they are generated.
-        
+
         Args:
             text: Input text to synthesize
+            language_id: Language code (only used with multilingual model).
+                         For English-only model, this is ignored.
             audio_prompt_path: Optional path to reference audio for voice cloning
             exaggeration: Emotion exaggeration factor
             cfg_weight: Classifier-free guidance weight
@@ -521,21 +659,33 @@ class ChatterboxTTS:
             context_window: The context passed for each chunk
             fade_duration: Seconds to apply linear fade-in on each chunk
             print_metrics: Whether to print RTF and latency metrics
-            
+
         Yields:
             Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
             and metrics contains timing information
         """
+        # Validate language_id for multilingual model
+        if self.multilingual and language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. "
+                f"Supported languages: {supported_langs}"
+            )
+
         start_time = time.time()
         metrics = StreamingMetrics()
-        
+
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
         # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
+        if self.conds and self.conds.t3.emotion_adv is not None:
+            current_exag = float(self.conds.t3.emotion_adv[0, 0, 0].item())
+        else:
+            current_exag = 0.0
+        if float(exaggeration) != current_exag:
             _cond: T3Cond = self.conds.t3
             self.conds.t3 = T3Cond(
                 speaker_emb=_cond.speaker_emb,
@@ -545,7 +695,12 @@ class ChatterboxTTS:
 
         # Norm and tokenize text
         text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        if self.multilingual:
+            text_tokens = self.tokenizer.text_to_tokens(
+                text, language_id=language_id.lower() if language_id else None
+            ).to(self.device)
+        else:
+            text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
         text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
 
         sot = self.t3.hp.start_text_token

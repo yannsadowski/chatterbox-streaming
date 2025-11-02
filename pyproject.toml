@@ -21,7 +21,7 @@ dependencies = [
     "matplotlib",
     "whisper-openai",
     "jiwer",
-    "sounddevice==0.5.2"
+    "sounddevice==0.5.2",
     "safetensors==0.5.3",
     "spacy-pkuseg",
     "pykakasi==2.3.0",
