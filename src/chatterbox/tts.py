@@ -319,7 +319,7 @@ class ChatterboxTTS:
         self,
         text,
         language_id=None,
-        repetition_penalty=1.2,
+        repetition_penalty=1.1,
         min_p=0.05,
         top_p=1.0,
         audio_prompt_path=None,
@@ -641,7 +641,7 @@ class ChatterboxTTS:
         temperature: float = 0.8,
         chunk_size: int = 25,  # Tokens per chunk
         context_window = 50,
-        fade_duration=0.02,  # seconds to apply linear fade-in on each chunk
+        fade_duration=0.001,  # seconds to apply linear fade-in on each chunk
         print_metrics: bool = True,
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """

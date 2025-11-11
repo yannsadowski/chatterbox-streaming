@@ -31,14 +31,17 @@ dependencies = [
     "s3tokenizer",
     "torch>=2.0.0",
     "torchaudio>=2.0.0",
-    "transformers>=4.30.0",
+    "transformers>=4.48.2",
     "diffusers>=0.20.0",
     "resemble-perth>=1.0.0",
     "conformer>=0.3.0",
     "matplotlib",
     "safetensors>=0.4.0",
-    "onnx>=1.15.0,<1.19.0",  # Compatibility with ml-dtypes
+    "onnx>=1.15.0,<1.19.0", # Compatibility with ml-dtypes
     "ml-dtypes>=0.3.0,<0.5.0",
+    "sounddevice>=0.5.2",
+    "torchcodec>=0.8.1",
+    "peft>=0.17.1",
 ]
 
 [project.optional-dependencies]

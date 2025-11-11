@@ -133,10 +133,15 @@ class AlignmentStreamAnalyzer:
         last_text_token_duration = A[15:, -3:].sum()
 
         # Activations for the final token that last too long are likely hallucinations.
-        long_tail = self.complete and (A[self.completed_at:, -3:].sum(dim=0).max() >= 5) # 200ms
+        # REDUCED THRESHOLD: 3 frames (120ms) instead of 5 (200ms) for faster hallucination cutoff
+        long_tail = self.complete and (A[self.completed_at:, -3:].sum(dim=0).max() >= 3) # 120ms
 
         # If there are activations in previous tokens after generation has completed, assume this is a repetition error.
-        alignment_repetition = self.complete and (A[self.completed_at:, :-5].max(dim=1).values.sum() > 5)
+        # REDUCED THRESHOLD: 3 instead of 5 for more aggressive repetition detection
+        alignment_repetition = self.complete and (A[self.completed_at:, :-5].max(dim=1).values.sum() > 3)
+
+        # NEW: Hard stop if generation continues too long after completion (10 frames = 400ms)
+        excessive_tail = self.complete and self.completed_at is not None and (T - self.completed_at > 10)
         
         # Track generated tokens for repetition detection
         if next_token is not None:
@@ -151,25 +156,24 @@ class AlignmentStreamAnalyzer:
             if len(self.generated_tokens) > 8:
                 self.generated_tokens = self.generated_tokens[-8:]
             
-        # Check for excessive token repetition (3x same token in a row)
+        # Check for excessive token repetition (3x same token in a row - more aggressive)
         token_repetition = (
-            # self.complete and 
             len(self.generated_tokens) >= 3 and
-            len(set(self.generated_tokens[-2:])) == 1
+            len(set(self.generated_tokens[-3:])) == 1
         )
         
         if token_repetition:
             repeated_token = self.generated_tokens[-1]
-            logger.warning(f"🚨 Detected 2x repetition of token {repeated_token}")
-            
+            logger.warning(f"🚨 Detected 3x repetition of token {repeated_token}")
+
         # Suppress EoS to prevent early termination
         if cur_text_posn < S - 3 and S > 5:  # Only suppress if text is longer than 5 tokens
             logits[..., self.eos_idx] = -2**15
 
         # If a bad ending is detected, force emit EOS by modifying logits
         # NOTE: this means logits may be inconsistent with latents!
-        if long_tail or alignment_repetition or token_repetition:
-            logger.warning(f"forcing EOS token, {long_tail=}, {alignment_repetition=}, {token_repetition=}")
+        if long_tail or alignment_repetition or token_repetition or excessive_tail:
+            logger.warning(f"forcing EOS token, {long_tail=}, {alignment_repetition=}, {token_repetition=}, {excessive_tail=}")
             # (±2**15 is safe for all dtypes >= 16bit)
             logits = -(2**15) * torch.ones_like(logits)
             logits[..., self.eos_idx] = 2**15

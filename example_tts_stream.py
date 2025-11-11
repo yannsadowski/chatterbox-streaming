@@ -104,15 +104,15 @@ else:
     device = "cpu"
 
 print(f"Using device: {device}")
-model = ChatterboxTTS.from_pretrained(device=device)
+model = ChatterboxTTS.from_pretrained(device=device,multilingual=True)
 
-text = "Ezreal and Jinx teamed up with Ahri, Yasuo, and Teemo to take down the enemy's Nexus in an epic late-game pentakill."
+text = "Bonjour, comment ça va? Ceci est le modèle de synthèse vocale multilingue Chatterbox, il prend en charge 23 langues."
 
 # Original non-streaming generation
 print("Generating audio (non-streaming)...")
 wav = None
 try:
-    wav = model.generate(text)
+    wav = model.generate(text, language_id="fr",  audio_prompt_path="voices/guillaume.wav")
     ta.save("test-1.wav", wav, model.sr)
     print(f"Saved non-streaming audio to test-1.wav")
 except Exception as e:
@@ -137,10 +137,12 @@ else:
 try:
     for audio_chunk, metrics in model.generate_stream(
         text=text,
+        language_id="fr",
+        audio_prompt_path="voices/guillaume.wav",
         chunk_size=25,  # tokens per chunk
-        exaggeration= 0.5,
-        temperature=0.8,
-        cfg_weight=0.5,
+        exaggeration= 0.4,
+        temperature=0.6,
+        cfg_weight=0.8,
         print_metrics=True
     ):
         chunk_count += 1
