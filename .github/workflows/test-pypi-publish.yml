@@ -47,7 +47,7 @@ jobs:
 
     environment:
       name: testpypi
-      url: https://test.pypi.org/project/chatterbox-streaming/
+      url: https://test.pypi.org/project/chatterbox-streaming-mtl/
 
     steps:
       - name: Retrieve release distributions
