@@ -2,7 +2,7 @@ from pathlib import Path
 
 import librosa
 import torch
-import perth
+from perth.dummy_watermarker import DummyWatermarker
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
@@ -26,7 +26,7 @@ class ChatterboxVC:
         self.sr = S3GEN_SR
         self.s3gen = s3gen
         self.device = device
-        self.watermarker = perth.PerthImplicitWatermarker()
+        self.watermarker = DummyWatermarker()
         if ref_dict is None:
             self.ref_dict = None
         else:

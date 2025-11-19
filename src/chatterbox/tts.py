@@ -7,7 +7,7 @@ from typing import Generator, Tuple, Optional
 import librosa
 import numpy as np
 import torch
-import perth
+from perth.dummy_watermarker import DummyWatermarker
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors.torch import load_file
@@ -166,7 +166,7 @@ class ChatterboxTTS:
         self.tokenizer = tokenizer
         self.device = device
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
+        self.watermarker = DummyWatermarker()
         self.multilingual = multilingual
 
     @classmethod
@@ -428,13 +428,30 @@ class ChatterboxTTS:
         temperature=0.8,
         cfg_weight=0.5,
         chunk_size=25,  # Number of tokens per chunk
+        repetition_penalty=1.2,  # Now configurable (was hardcoded to 2.0)
+        min_p=0.0,  # Minimum probability threshold
+        top_p=0.95,  # Top-p sampling threshold (was hardcoded to 0.8)
+        # AlignmentStreamAnalyzer parameters for hallucination detection
+        token_repetition_threshold=5,  # 0 to disable token repetition detection
+        long_tail_threshold=5,
+        alignment_repetition_threshold=5,
+        excessive_tail_threshold=10,
     ) -> Generator[torch.Tensor, None, None]:
         """
         Streaming version of T3 inference that yields speech tokens in chunks
+
+        Args:
+            repetition_penalty: Penalty for repeating tokens (default 1.2, was hardcoded to 2.0)
+            min_p: Minimum probability threshold for sampling (default 0.0)
+            top_p: Top-p nucleus sampling threshold (default 0.95, was hardcoded to 0.8)
+            token_repetition_threshold: Stop if this many identical tokens in a row (0=disable, default=5)
+            long_tail_threshold: Stop if final token activation exceeds this many frames (default=5)
+            alignment_repetition_threshold: Stop if previous token activations exceed threshold (default=5)
+            excessive_tail_threshold: Hard stop after this many frames past completion (default=10)
         """
         from tqdm import tqdm
         import torch.nn.functional as F
-        from transformers.generation.logits_process import TopPLogitsWarper, RepetitionPenaltyLogitsProcessor
+        from transformers.generation.logits_process import TopPLogitsWarper, RepetitionPenaltyLogitsProcessor, MinPLogitsWarper
 
         # Validate inputs
         text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
@@ -453,13 +470,18 @@ class ChatterboxTTS:
         if not self.t3.compiled:
             from .models.t3.inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
             from .models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
-            
+
             alignment_stream_analyzer = AlignmentStreamAnalyzer(
                 self.t3.tfmr,
                 None,
                 text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
                 alignment_layer_idx=9,
                 eos_idx=self.t3.hp.stop_speech_token,
+                # Pass configurable thresholds
+                token_repetition_threshold=token_repetition_threshold,
+                long_tail_threshold=long_tail_threshold,
+                alignment_repetition_threshold=alignment_repetition_threshold,
+                excessive_tail_threshold=excessive_tail_threshold,
             )
             patched_model = T3HuggingfaceBackend(
                 config=self.t3.cfg,
@@ -488,9 +510,10 @@ class ChatterboxTTS:
         predicted = []
         chunk_buffer = []
 
-        # Instantiate logits processors
-        top_p_warper = TopPLogitsWarper(top_p=0.8)
-        repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=2.0)
+        # Instantiate logits processors with configurable parameters
+        top_p_warper = TopPLogitsWarper(top_p=top_p) if top_p < 1.0 else None
+        min_p_warper = MinPLogitsWarper(min_p=min_p) if min_p > 0.0 else None
+        repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
 
         # Initial forward pass
         output = self.t3.patched_model(
@@ -517,9 +540,16 @@ class ChatterboxTTS:
             if temperature != 1.0:
                 logits = logits / temperature
 
-            # Apply repetition penalty and top‑p filtering
+            # Apply repetition penalty
             logits = repetition_penalty_processor(generated_ids, logits)
-            logits = top_p_warper(None, logits)
+
+            # Apply min_p filtering if enabled
+            if min_p_warper is not None:
+                logits = min_p_warper(None, logits)
+
+            # Apply top_p filtering if enabled
+            if top_p_warper is not None:
+                logits = top_p_warper(None, logits)
 
             # Convert logits to probabilities and sample
             probs = torch.softmax(logits, dim=-1)
@@ -643,6 +673,15 @@ class ChatterboxTTS:
         context_window = 50,
         fade_duration=0.001,  # seconds to apply linear fade-in on each chunk
         print_metrics: bool = True,
+        # New configurable parameters
+        repetition_penalty: float = 1.2,  # Penalty for token repetition
+        min_p: float = 0.0,  # Minimum probability threshold
+        top_p: float = 0.95,  # Top-p nucleus sampling
+        # Hallucination detection thresholds (set to 0 to disable)
+        token_repetition_threshold: int = 5,  # Stop after N identical tokens (0=disable)
+        long_tail_threshold: int = 5,  # Stop after N frames of final token
+        alignment_repetition_threshold: int = 5,  # Stop if previous tokens reactivate
+        excessive_tail_threshold: int = 10,  # Hard stop after N frames past completion
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming version of generate that yields audio chunks as they are generated.
@@ -652,13 +691,20 @@ class ChatterboxTTS:
             language_id: Language code (only used with multilingual model).
                          For English-only model, this is ignored.
             audio_prompt_path: Optional path to reference audio for voice cloning
-            exaggeration: Emotion exaggeration factor
-            cfg_weight: Classifier-free guidance weight
-            temperature: Sampling temperature
-            chunk_size: Number of speech tokens per chunk
+            exaggeration: Emotion exaggeration factor (0.0-1.0+)
+            cfg_weight: Classifier-free guidance weight (0.0-1.0)
+            temperature: Sampling temperature (0.1-1.5)
+            chunk_size: Number of speech tokens per chunk (lower = lower latency)
             context_window: The context passed for each chunk
             fade_duration: Seconds to apply linear fade-in on each chunk
             print_metrics: Whether to print RTF and latency metrics
+            repetition_penalty: Penalty for token repetition (1.0=none, 2.0=strong)
+            min_p: Minimum probability threshold for sampling (0.0=disabled)
+            top_p: Top-p nucleus sampling threshold (1.0=disabled)
+            token_repetition_threshold: Stop after N identical consecutive tokens (0=disabled)
+            long_tail_threshold: Stop after N frames of final token activation (0=disabled)
+            alignment_repetition_threshold: Stop if previous tokens reactivate after completion (0=disabled)
+            excessive_tail_threshold: Hard stop N frames after completion (0=disabled)
 
         Yields:
             Tuple of (audio_chunk, metrics) where audio_chunk is a torch.Tensor
@@ -720,6 +766,13 @@ class ChatterboxTTS:
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 chunk_size=chunk_size,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+                token_repetition_threshold=token_repetition_threshold,
+                long_tail_threshold=long_tail_threshold,
+                alignment_repetition_threshold=alignment_repetition_threshold,
+                excessive_tail_threshold=excessive_tail_threshold,
             ):
                 # Extract only the conditional batch
                 token_chunk = token_chunk[0]
