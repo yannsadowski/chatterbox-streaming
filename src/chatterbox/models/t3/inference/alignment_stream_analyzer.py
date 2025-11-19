@@ -43,7 +43,7 @@ class AlignmentStreamAnalyzer:
         alignment_repetition_threshold=5,  # Activations in previous tokens after completion (was 3)
         excessive_tail_threshold=10,  # Max frames after completion before hard stop
         pause_tokens=None,  # List of token IDs that are allowed to repeat more (e.g., silence tokens)
-        pause_token_multiplier=2.0,  # Multiply threshold for pause tokens (default: 2x)
+        pause_token_multiplier=4.0,  # Multiply threshold for pause tokens (default: 4x)
     ):
         """
         Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
@@ -59,7 +59,7 @@ class AlignmentStreamAnalyzer:
             alignment_repetition_threshold: Stop if previous token activations exceed this after completion (default=5)
             excessive_tail_threshold: Hard stop if generation continues this many frames after completion (default=10)
             pause_tokens: List of token IDs for silence/pause (e.g., [4218]). These can repeat more.
-            pause_token_multiplier: Multiply threshold for pause tokens (default: 2.0 = double the threshold)
+            pause_token_multiplier: Multiply threshold for pause tokens (default: 4.0 = 4x the threshold)
         """
         # self.queue = queue
         self.text_tokens_slice = (i, j) = text_tokens_slice
