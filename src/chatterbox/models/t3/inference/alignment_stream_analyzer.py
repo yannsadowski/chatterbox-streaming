@@ -30,7 +30,21 @@ class AlignmentAnalysisResult:
 
 
 class AlignmentStreamAnalyzer:
-    def __init__(self, tfmr, queue, text_tokens_slice, alignment_layer_idx=9, eos_idx=0):
+    def __init__(
+        self,
+        tfmr,
+        queue,
+        text_tokens_slice,
+        alignment_layer_idx=9,
+        eos_idx=0,
+        # New configurable parameters for hallucination detection
+        token_repetition_threshold=5,  # Number of identical consecutive tokens before stopping (0 to disable)
+        long_tail_threshold=5,  # Frames of final token activation before stopping (was 3)
+        alignment_repetition_threshold=5,  # Activations in previous tokens after completion (was 3)
+        excessive_tail_threshold=10,  # Max frames after completion before hard stop
+        pause_tokens=None,  # List of token IDs that are allowed to repeat more (e.g., silence tokens)
+        pause_token_multiplier=2.0,  # Multiply threshold for pause tokens (default: 2x)
+    ):
         """
         Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
         activation maps. This module exploits this to perform online integrity checks which streaming.
@@ -38,6 +52,14 @@ class AlignmentStreamAnalyzer:
         position, repetition, etc.
 
         NOTE: currently requires no queues.
+
+        Args:
+            token_repetition_threshold: Stop if this many identical tokens in a row (0=disabled, default=5)
+            long_tail_threshold: Stop if final token activation exceeds this many frames (default=5)
+            alignment_repetition_threshold: Stop if previous token activations exceed this after completion (default=5)
+            excessive_tail_threshold: Hard stop if generation continues this many frames after completion (default=10)
+            pause_tokens: List of token IDs for silence/pause (e.g., [4218]). These can repeat more.
+            pause_token_multiplier: Multiply threshold for pause tokens (default: 2.0 = double the threshold)
         """
         # self.queue = queue
         self.text_tokens_slice = (i, j) = text_tokens_slice
@@ -52,9 +74,19 @@ class AlignmentStreamAnalyzer:
 
         self.complete = False
         self.completed_at = None
-        
+
         # Track generated tokens for repetition detection
         self.generated_tokens = []
+
+        # Configurable thresholds
+        self.token_repetition_threshold = token_repetition_threshold
+        self.long_tail_threshold = long_tail_threshold
+        self.alignment_repetition_threshold = alignment_repetition_threshold
+        self.excessive_tail_threshold = excessive_tail_threshold
+
+        # Pause token special handling
+        self.pause_tokens = set(pause_tokens) if pause_tokens else {4218, 4137}  # Default pause tokens
+        self.pause_token_multiplier = pause_token_multiplier
 
         # Using `output_attentions=True` is incompatible with optimized attention kernels, so
         # using it for all layers slows things down too much. We can apply it to just one layer
@@ -133,15 +165,26 @@ class AlignmentStreamAnalyzer:
         last_text_token_duration = A[15:, -3:].sum()
 
         # Activations for the final token that last too long are likely hallucinations.
-        # REDUCED THRESHOLD: 3 frames (120ms) instead of 5 (200ms) for faster hallucination cutoff
-        long_tail = self.complete and (A[self.completed_at:, -3:].sum(dim=0).max() >= 3) # 120ms
+        long_tail = (
+            self.long_tail_threshold > 0 and
+            self.complete and
+            (A[self.completed_at:, -3:].sum(dim=0).max() >= self.long_tail_threshold)
+        )
 
         # If there are activations in previous tokens after generation has completed, assume this is a repetition error.
-        # REDUCED THRESHOLD: 3 instead of 5 for more aggressive repetition detection
-        alignment_repetition = self.complete and (A[self.completed_at:, :-5].max(dim=1).values.sum() > 3)
+        alignment_repetition = (
+            self.alignment_repetition_threshold > 0 and
+            self.complete and
+            (A[self.completed_at:, :-5].max(dim=1).values.sum() > self.alignment_repetition_threshold)
+        )
 
-        # NEW: Hard stop if generation continues too long after completion (10 frames = 400ms)
-        excessive_tail = self.complete and self.completed_at is not None and (T - self.completed_at > 10)
+        # Hard stop if generation continues too long after completion
+        excessive_tail = (
+            self.excessive_tail_threshold > 0 and
+            self.complete and
+            self.completed_at is not None and
+            (T - self.completed_at > self.excessive_tail_threshold)
+        )
         
         # Track generated tokens for repetition detection
         if next_token is not None:
@@ -151,20 +194,35 @@ class AlignmentStreamAnalyzer:
             else:
                 token_id = next_token
             self.generated_tokens.append(token_id)
-            
-            # Keep only last 8 tokens to prevent memory issues
-            if len(self.generated_tokens) > 8:
-                self.generated_tokens = self.generated_tokens[-8:]
-            
-        # Check for excessive token repetition (3x same token in a row - more aggressive)
-        token_repetition = (
-            len(self.generated_tokens) >= 3 and
-            len(set(self.generated_tokens[-3:])) == 1
-        )
-        
-        if token_repetition:
-            repeated_token = self.generated_tokens[-1]
-            logger.warning(f"🚨 Detected 3x repetition of token {repeated_token}")
+
+            # Keep only last tokens needed for repetition check (consider pause token multiplier)
+            max_pause_threshold = int(self.token_repetition_threshold * self.pause_token_multiplier) if self.pause_token_multiplier > 0 else self.token_repetition_threshold
+            max_window = max(8, max_pause_threshold, self.token_repetition_threshold)
+            if len(self.generated_tokens) > max_window:
+                self.generated_tokens = self.generated_tokens[-max_window:]
+
+        # Check for excessive token repetition (configurable threshold)
+        token_repetition = False
+        if self.token_repetition_threshold > 0 and len(self.generated_tokens) >= self.token_repetition_threshold:
+            # Check if all last N tokens are the same
+            if len(set(self.generated_tokens[-self.token_repetition_threshold:])) == 1:
+                repeated_token = self.generated_tokens[-1]
+
+                # Special handling for pause tokens - allow them to repeat more
+                if repeated_token in self.pause_tokens:
+                    # Use multiplied threshold for pause tokens
+                    pause_threshold = int(self.token_repetition_threshold * self.pause_token_multiplier)
+                    if len(self.generated_tokens) >= pause_threshold:
+                        if len(set(self.generated_tokens[-pause_threshold:])) == 1:
+                            token_repetition = True
+                            logger.warning(f"🚨 Detected {pause_threshold}x repetition of PAUSE token {repeated_token} (threshold: {pause_threshold})")
+                        else:
+                            logger.info(f"ℹ️  Pause token {repeated_token} repeated {self.token_repetition_threshold}x (allowed up to {pause_threshold}x)")
+                    # else: not enough repetitions yet for pause token
+                else:
+                    # Regular token - use normal threshold
+                    token_repetition = True
+                    logger.warning(f"🚨 Detected {self.token_repetition_threshold}x repetition of token {repeated_token}")
 
         # Suppress EoS to prevent early termination
         if cur_text_posn < S - 3 and S > 5:  # Only suppress if text is longer than 5 tokens

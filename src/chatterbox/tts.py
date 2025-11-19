@@ -436,6 +436,8 @@ class ChatterboxTTS:
         long_tail_threshold=5,
         alignment_repetition_threshold=5,
         excessive_tail_threshold=10,
+        pause_tokens=None,  # List of pause/silence token IDs (default: [4218])
+        pause_token_multiplier=2.0,  # Multiply threshold for pause tokens (default: 2x)
     ) -> Generator[torch.Tensor, None, None]:
         """
         Streaming version of T3 inference that yields speech tokens in chunks
@@ -482,6 +484,8 @@ class ChatterboxTTS:
                 long_tail_threshold=long_tail_threshold,
                 alignment_repetition_threshold=alignment_repetition_threshold,
                 excessive_tail_threshold=excessive_tail_threshold,
+                pause_tokens=pause_tokens,
+                pause_token_multiplier=pause_token_multiplier,
             )
             patched_model = T3HuggingfaceBackend(
                 config=self.t3.cfg,
@@ -682,6 +686,8 @@ class ChatterboxTTS:
         long_tail_threshold: int = 5,  # Stop after N frames of final token
         alignment_repetition_threshold: int = 5,  # Stop if previous tokens reactivate
         excessive_tail_threshold: int = 10,  # Hard stop after N frames past completion
+        pause_tokens=None,  # List of pause/silence token IDs (default: [4218])
+        pause_token_multiplier: float = 2.0,  # Multiply threshold for pause tokens (default: 2x)
     ) -> Generator[Tuple[torch.Tensor, StreamingMetrics], None, None]:
         """
         Streaming version of generate that yields audio chunks as they are generated.
@@ -773,6 +779,8 @@ class ChatterboxTTS:
                 long_tail_threshold=long_tail_threshold,
                 alignment_repetition_threshold=alignment_repetition_threshold,
                 excessive_tail_threshold=excessive_tail_threshold,
+                pause_tokens=pause_tokens,
+                pause_token_multiplier=pause_token_multiplier,
             ):
                 # Extract only the conditional batch
                 token_chunk = token_chunk[0]
